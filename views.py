@@ -15,8 +15,9 @@ class Model(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
         torch.manual_seed(0)
-        self.weight = torch.nn.Parameter(torch.randn(5, 7))
-        self.bias = torch.nn.Parameter(torch.randn((7,)))
+        # self.weight = torch.nn.Parameter(torch.randn(5, 7))
+        # self.bias = torch.nn.Parameter(torch.randn((7,)))
+        self.linear = torch.nn.Linear(5, 7)
         self.relu = torch.nn.ReLU()
 
         self._pre_bwd_hooks_to_run = 2  # weight, bias
@@ -26,19 +27,18 @@ class Model(torch.nn.Module):
         """Flattens the weight and bias into a flattened parameter and modifies
         their storage to point into the flattened parameter's storage."""
         self.flat_param = FlatParameter(torch.cat(
-            [self.weight.reshape(-1), self.bias.reshape(-1)], 0,
+            [self.linear.weight.reshape(-1), self.linear.bias.reshape(-1)], 0,
         ))
         views = torch.split(
-            self.flat_param, [self.weight.numel(), self.bias.numel()], dim=0,
+            self.flat_param, [self.linear.weight.numel(), self.linear.bias.numel()], dim=0,
         )
         # Operations on `weight` and `bias` do not propagate through the
         # autograd graph
-        self.weight.data = views[0].view(self.weight.shape)
-        self.bias.data = views[1].view(self.bias.shape)
+        self.linear.weight.data = views[0].view(self.linear.weight.shape)
+        self.linear.bias.data = views[1].view(self.linear.bias.shape)
 
     def forward(self, x):
-        z = x @ self.weight
-        z += self.bias
+        z = self.linear(x)
         return self.relu(z)
 
     def register_pre_bwd_hooks(self, verbose: bool = False):
@@ -61,14 +61,14 @@ class Model(torch.nn.Module):
             # Set the original parameters' `.grad` as views into the flattened
             # gradient
             offset = 0
-            for param in (self.weight, self.bias):
+            for param in (self.linear.weight, self.linear.bias):
                 param.grad = torch.narrow(
                     self.flat_param.grad, 0, offset, param.numel(),
                 ).view(param.shape)
                 offset += param.numel()
 
-        self.weight.register_hook(functools.partial(pre_bwd_hook, "weight"))
-        self.bias.register_hook(functools.partial(pre_bwd_hook, "bias"))
+        self.linear.weight.register_hook(functools.partial(pre_bwd_hook, "weight"))
+        self.linear.bias.register_hook(functools.partial(pre_bwd_hook, "bias"))
 
     def register_post_bwd_hooks(self, verbose: bool = False):
         def post_bwd_hook(param_name: str, *unused: Any):
@@ -81,7 +81,7 @@ class Model(torch.nn.Module):
                     print(f"\"Reduce scatter\" from {param_name}!")
                 self._pre_bwd_hooks_to_run = 2  # reset for next iteration
 
-        for p, n in [(self.weight, "weight"), (self.bias, "bias")]:
+        for p, n in [(self.linear.weight, "weight"), (self.linear.bias, "bias")]:
             p_tmp = p.expand_as(p)
             grad_acc = p_tmp.grad_fn.next_functions[0][0]
             grad_acc.register_hook(functools.partial(post_bwd_hook, n))
@@ -103,14 +103,14 @@ class Model(torch.nn.Module):
 
 def check_model_parameters(models: List[torch.nn.Module]):
     for model1, model2 in itertools.combinations(models, 2):
-        assert torch.allclose(model1.weight, model2.weight)
-        assert torch.allclose(model1.bias, model2.bias)
+        assert torch.allclose(model1.linear.weight, model2.linear.weight)
+        assert torch.allclose(model1.linear.bias, model2.linear.bias)
 
 
 def check_model_gradients(models: List[torch.nn.Module]):
     for model1, model2 in itertools.combinations(models, 2):
-        assert torch.allclose(model1.weight.grad, model2.weight.grad)
-        assert torch.allclose(model1.bias.grad, model2.bias.grad)
+        assert torch.allclose(model1.linear.weight.grad, model2.linear.weight.grad)
+        assert torch.allclose(model1.linear.bias.grad, model2.linear.bias.grad)
 
 
 def fwd_bwd(models: List[torch.nn.Module], inp):
@@ -149,7 +149,7 @@ def main():
     model2.flatten()
     model2.register_pre_bwd_hooks()
     model2.register_post_bwd_hooks()
-    optim2 = torch.optim.Adam([model2.weight, model2.bias], lr=LR)
+    optim2 = torch.optim.Adam([model2.linear.weight, model2.linear.bias], lr=LR)
     # Model with flattening, to optimize in terms of the flattened parameter
     model3 = Model()
     model3.flatten()
