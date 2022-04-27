@@ -15,12 +15,15 @@ class Model(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
         torch.manual_seed(0)
-        # self.weight = torch.nn.Parameter(torch.randn(5, 7))
-        # self.bias = torch.nn.Parameter(torch.randn((7,)))
         self.linear = torch.nn.Linear(5, 7)
         self.relu = torch.nn.ReLU()
 
-        self._pre_bwd_hooks_to_run = 2  # weight, bias
+        # This is constructed as a dict once per iteration in the first
+        # pre-backward hook to run, which iterates over this module's
+        # parameters and adds an entry to mapping parameters with
+        # `requires_grad=True` to `False` to indicate to wait for their
+        # gradient to be ready before running the post-backward hook logic
+        self._param_to_is_grad_ready = None
 
     @torch.no_grad()
     def flatten(self):
@@ -42,18 +45,23 @@ class Model(torch.nn.Module):
         return self.relu(z)
 
     def register_pre_bwd_hooks(self, verbose: bool = False):
-        def pre_bwd_hook(param_name: str, *unused: Any):
+        def pre_bwd_hook(param, param_name: str, *unused: Any):
             """Allocates a gradient for the flattened parameter if needed and
             ensures on the first pre-backward hook of this iteration that each
             original parameter's ``.grad`` points into this allocated
             gradient."""
             if verbose:
                 print(f"Pre bwd hook from {param_name}!")
-            if self._pre_bwd_hooks_to_run < 2:
-                self._pre_bwd_hooks_to_run -= 1
+            if self._param_to_is_grad_ready is None:
+                self._param_to_is_grad_ready = {}
+                for p in self.parameters():
+                    if p.requires_grad:
+                        self._param_to_is_grad_ready[p] = False
+            if any(self._param_to_is_grad_ready.values()):
+                self._param_to_is_grad_ready[param] = True
                 assert self.flat_param.grad is not None
                 return
-            self._pre_bwd_hooks_to_run -= 1
+            # self._param_to_is_grad_ready[param] = True
             if self.flat_param.grad is None:
                 # Must be initialized as zero for mathematical correctness
                 self.flat_param.grad = torch.zeros_like(self.flat_param)
@@ -67,8 +75,8 @@ class Model(torch.nn.Module):
                 ).view(param.shape)
                 offset += param.numel()
 
-        self.linear.weight.register_hook(functools.partial(pre_bwd_hook, "weight"))
-        self.linear.bias.register_hook(functools.partial(pre_bwd_hook, "bias"))
+        self.linear.weight.register_hook(functools.partial(pre_bwd_hook, self.linear.weight, "weight"))
+        self.linear.bias.register_hook(functools.partial(pre_bwd_hook, self.linear.bias, "bias"))
 
     def register_post_bwd_hooks(self, verbose: bool = False):
         def post_bwd_hook(param_name: str, *unused: Any):
@@ -76,10 +84,10 @@ class Model(torch.nn.Module):
             last one to be called for this module."""
             if verbose:
                 print(f"Post bwd hook from {param_name}!")
-            if self._pre_bwd_hooks_to_run == 0:
+            if all(self._param_to_is_grad_ready.values()):
                 if verbose:
                     print(f"\"Reduce scatter\" from {param_name}!")
-                self._pre_bwd_hooks_to_run = 2  # reset for next iteration
+                self._param_to_is_grad_ready = None  # reset for next iteration
 
         for p, n in [(self.linear.weight, "weight"), (self.linear.bias, "bias")]:
             p_tmp = p.expand_as(p)
