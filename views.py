@@ -1,6 +1,6 @@
 import functools
 import itertools
-from typing import Any, List, Set
+from typing import Any, List, NamedTuple, Optional
 
 import torch
 
@@ -11,26 +11,28 @@ class FlatParameter(torch.nn.Parameter):
     ...
 
 
+class ParamInfo(NamedTuple):
+    module: torch.nn.Module
+    param: torch.nn.Parameter
+    param_name: str
+
+
 class Model(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
         torch.manual_seed(0)
         self.linear0 = torch.nn.Linear(5, 7)
-        self.linear1 = torch.nn.Linear(7, 3)
+        self.linear1 = torch.nn.Linear(7, 5)
         self.relu = torch.nn.ReLU()
 
-        # This is constructed as a dict once per iteration in the first
-        # pre-backward hook to run, which iterates over this module's
-        # parameters and adds an entry to mapping parameters with
-        # `requires_grad=True` to `False` to indicate to wait for their
-        # gradient to be ready before running the post-backward hook logic
-        self._param_to_is_grad_ready = None
+        # Save the `AccumulateGrad` object to ensure the registered post-hook
+        # runs (or else a new `AccumulateGrad` object without the hook may be
+        # created
+        self._acc_grad: Optional[torch.AccumulateGrad] = None
 
-        # Save the `AccumulateGrad` objects to ensure the registered post-hooks
-        # run (or else new `AccumulateGrad` objects without the hooks may be
-        # created); use a set to avoid the data structure from using increasing
-        # memory over the iterations
-        self.grad_accs: Set[torch.AccumulateGrad] = set()
+        # Save parameter information for switching between `Tensor` views and
+        # the original parameters
+        self._param_infos: List[ParamInfo] = []
 
     def flatten(self):
         """Flattens the weight and bias into a flattened parameter and modifies
@@ -45,13 +47,58 @@ class Model(torch.nn.Module):
             )
             for param, view in zip(self.parameters(), views):
                 param.data = view.view(param.shape)
+
+        for _, module in self.named_modules():
+            for param_name, param in module.named_parameters(recurse=False):
+                # `param_name` does not include any module prefixes
+                self._param_infos.append(ParamInfo(module, param, param_name))
+                param.requires_grad_(True)
+
+    def _to_flat_param_views(self):
+        """Replace the model parameters with tensor views."""
+        numels = []
+        shapes = []
         for param in self.parameters():
-            param.requires_grad_(True)
+            numels.append(param.numel())
+            shapes.append(param.shape)
+        views = (
+            tensor.view(shape)
+            for (tensor, shape) in zip(self.flat_param.split(numels), shapes)
+        )
+        for view, (module, param, param_name) in zip(
+            views, self._param_infos,
+        ):
+            assert param.shape == view.shape, \
+                f"param: {param.shape} view: {view.shape}"
+            delattr(module, param_name)
+            setattr(module, param_name, view)
+
+    def _to_parameters(self):
+        """Restore the model parameters."""
+        for (module, param, param_name) in self._param_infos:
+            setattr(module, param_name, param)
+        self._set_grads_as_views()
+
+    def _set_grads_as_views(self):
+        offset = 0
+        for param in self.parameters():
+            param.grad = torch.narrow(
+                self.flat_param.grad, 0, offset, param.numel(),
+            ).view(param.shape)
+            offset += param.numel()
 
     def forward(self, x):
-        z = self.linear0(x)
+        # Switch to using `Tensor` views to have operators be recorded to the
+        # `FlatParameter` in the autograd graph
+        if hasattr(self, "flat_param"):
+            self._to_flat_param_views()
+        z = x
+        z = self.linear0(z)
         z = self.relu(z)
         z = self.linear1(z)
+        z = self.relu(z)
+        # Reuse `linear0` to have its parameters have gradient ready twice
+        z = self.linear0(z)
         z = self.relu(z)
         return z
 
@@ -63,30 +110,16 @@ class Model(torch.nn.Module):
             gradient."""
             if verbose:
                 print(f"Pre bwd hook from {param_name}!")
-            if self._param_to_is_grad_ready is None:
-                self._param_to_is_grad_ready = {}
-                for p in self.parameters():
-                    if p.requires_grad:
-                        self._param_to_is_grad_ready[p] = False
-            if any(self._param_to_is_grad_ready.values()):
-                self._param_to_is_grad_ready[param] = True
-                assert self.flat_param.grad is not None
-                return
             if self.flat_param.grad is None:
                 # Must be initialized as zero for mathematical correctness
                 self.flat_param.grad = torch.zeros_like(self.flat_param)
-            assert len(self.flat_param.grad.shape) == 1
             # Set the original parameters' `.grad` as views into the flattened
             # gradient
-            offset = 0
-            for param in self.parameters():
-                param.grad = torch.narrow(
-                    self.flat_param.grad, 0, offset, param.numel(),
-                ).view(param.shape)
-                offset += param.numel()
+            self._set_grads_as_views()
 
-        for param_name, param in self.named_parameters():
-            param.register_hook(functools.partial(pre_bwd_hook, param, param_name))
+        self.flat_param.register_hook(functools.partial(
+            pre_bwd_hook, self.flat_param, "flat_param",
+        ))
 
     def register_post_bwd_hooks(self, verbose: bool = False):
         def post_bwd_hook(param, param_name: str, *unused: Any):
@@ -94,19 +127,18 @@ class Model(torch.nn.Module):
             last one to be called for this module."""
             if verbose:
                 print(f"Post bwd hook from {param_name}!")
-            self._param_to_is_grad_ready[param] = True
-            if all(self._param_to_is_grad_ready.values()):
-                if verbose:
-                    print(f"\"Reduce scatter\" from {param_name}!")
-                self._param_to_is_grad_ready = None  # reset for next iteration
+            print(f"\"Reduce scatter\" from {param_name}!")
+            print("Sum of gradients in post-bwd:", torch.sum(self.flat_param.grad))
+            # Switch back to the original parameters
+            self._to_parameters()
 
-        for n, p in self.named_parameters():
-            assert p.requires_grad
-            p_tmp = p.expand_as(p)
-            grad_acc = p_tmp.grad_fn.next_functions[0][0]
-            grad_acc.register_hook(functools.partial(post_bwd_hook, p, n))
-            # Must keep a reference to the `AccumulateGrad` object
-            self.grad_accs.add(grad_acc)
+        p = self.flat_param
+        n = "flat_param"
+        p_tmp = p.expand_as(p)
+        acc_grad = p_tmp.grad_fn.next_functions[0][0]
+        acc_grad.register_hook(functools.partial(post_bwd_hook, p, n))
+        # Must keep a reference to the `AccumulateGrad` object
+        self._acc_grad = acc_grad
 
     def named_parameters(self, *args, **kwargs):
         for param_name, param in super().named_parameters(*args, **kwargs):
@@ -167,6 +199,12 @@ def run_iter(models, optims, inp, zero_grad: bool):
     check_model_parameters(models)
 
 
+def sum_gradients(model):
+    return torch.sum(
+        torch.cat([param.grad.flatten() for param in model.parameters()])
+    )
+
+
 def main():
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
@@ -200,8 +238,18 @@ def main():
     inp = torch.randn(8, 5)
     check_model_parameters(models)
     run_iter(models, optims, inp, False)
+    print("Sum of gradients (reference):", sum_gradients(model1))
+    print("\n\n\n")
+
+    inp = torch.randn(8, 5)
     run_iter(models, optims, inp, True)
+    print("Sum of gradients (reference):", sum_gradients(model1))
+    print("\n\n\n")
+
+    inp = torch.randn(8, 5)
     run_iter(models, optims, inp, True)
+    print("Sum of gradients (reference):", sum_gradients(model1))
+    print("\n\n\n")
 
     # Check that `.parameters()` returns the original parameters
     assert len(list(model1.parameters())) == 4
@@ -213,11 +261,6 @@ def main():
     assert len(list(model2.fsdp_parameters())) == 1
     assert len(list(model3.fsdp_parameters())) == 1
 
-    # Check that `grad_accs` do not grow in size over the iterations
-    assert len(model2.grad_accs) == len(list(model2.parameters()))
-    assert len(model3.grad_accs) == len(list(model3.parameters()))
-
-    print()
     print("Yay! Gradients and parameters match!")
 
 
